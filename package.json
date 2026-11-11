@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@cloudflare/computer": "latest",
-    "just-bash": "^3.3.0"
+    "just-bash": "0.9.1"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "latest",
