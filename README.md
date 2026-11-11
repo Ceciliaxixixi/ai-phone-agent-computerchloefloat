@@ -111,4 +111,3 @@
 | `exec` | `workspace, command` | 执行 shell 命令（fs-only 模式返回 501） |
 
 `workspace` 约定：角色用 `char:<角色id>`，工坊用 `workshop`。
-
