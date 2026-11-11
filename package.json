@@ -9,13 +9,13 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@cloudflare/computer": "latest",
+    "@cloudflare/computer": "0.9.1",
     "just-bash": "0.9.1"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "latest",
+    "@cloudflare/workers-types": "^4.20241022.0",
     "typescript": "^5.8.3",
-    "wrangler": "latest"
+    "wrangler": "^3.84.0"
   },
   "cloudflare": {
     "bindings": {
