@@ -4,72 +4,47 @@
 // 每台电脑是一个 Durable Object，硬盘是 DO 里的 SQLite 虚拟文件系统（持久、免费计划可用）。
 // shell 命令按可用性逐级选择：
 //   容器（真 Linux，付费计划可选开启）→ isolate（worker_loaders beta）→ 内嵌 just-bash（保底，免费可用）。
-//
-// 安全模型：
-//  - 所有请求必须带 Authorization: Bearer <AGENT_TOKEN>，密钥只在部署者自己手里；
-//  - workspace 名单字符集白名单，一个 workspace 一个 DO，天然互相隔离；
-//  - 路径禁止 ".."；输出与文件读取均有体积上限。
 
 import { DurableObject } from "cloudflare:workers";
 import { withWorkspace, getWorkspace, type DurableObjectStorageLike, type WorkspaceHandle } from "@cloudflare/computer";
 import { WorkerShellBackend, WorkspaceFsAdapter, type WorkerShellLoader } from "@cloudflare/computer/backends/worker-shell";
-import { CloudflareContainerBackend, withWorkspaceContainer } from "@cloudflare/computer/backends/container";
 import { Bash, NetworkAccessDeniedError, defineCommand, type SecureFetch } from "just-bash";
 
 // isolate shell 的动态 Worker 通过这个服务代理回连本 Worker 的 Workspace，必须从入口导出；
-// WorkspaceProxy 则是容器出网的回环绑定（ctx.exports 按入口导出解析），容器模式必需
 export { WorkspaceServiceProxy, WorkspaceProxy } from "@cloudflare/computer";
 
 type Env = {
   Computer: DurableObjectNamespace;
-  // worker_loaders 绑定；账号没有该能力时按 wrangler.jsonc 注释删除绑定即可（shell 降级）
   LOADER?: WorkerShellLoader;
   AGENT_TOKEN?: string;
 };
 
-// cloudflare:workers 的 DurableObject 里 ctx/env 是 protected，
-// withWorkspace 的选项工厂在类外运行，需要一层公开访问器。
 class ComputerBase extends DurableObject<Env> {
   get doCtx() { return this.ctx; }
   get doEnv() { return this.env; }
 }
 
-// 容器宿主层：wrangler.jsonc 里打开 containers 配置后，容器会挂在这个 DO 上
-//（ctx.container 出现），此时构造容器后端——computerd 跑在容器里，文件系统
-// 与 DO 硬盘经包内置的 capnweb 会话双向同步，命令看到的就是同一块盘。
-// 没挂容器（免费部署）时这里什么都不做，零开销。
-class ComputerContainerHost extends withWorkspaceContainer(ComputerBase) {
-  readonly containerBackend = (this.doCtx as { container?: unknown }).container
-    ? new CloudflareContainerBackend({
-        container: () => this,
-        workspace: { binding: "Computer", id: this.doCtx.id.toString() },
-        // 容器内命令直连外网（真 Linux 模式的网络是全功能的，README 有说明）
-        egress: { mode: "direct" },
-      })
-    : null;
+// 免费部署模式下使用纯 DO 运行，零开销
+class ComputerContainerHost extends ComputerBase {
+  readonly containerBackend = null;
 }
 
 export class Computer extends withWorkspace(
   ComputerContainerHost,
   (self) => ({
-    // workers-types 与包内自带类型对 SQL Row 的泛型声明有出入，运行时同物
     storage: self.doCtx.storage as unknown as DurableObjectStorageLike,
-    backends: self.containerBackend
-      ? [self.containerBackend]
-      : self.doEnv.LOADER
-        ? [
-            new WorkerShellBackend({
-              loader: self.doEnv.LOADER,
-              workspace: { binding: "Computer", id: self.doCtx.id.toString() },
-              ctx: self.doCtx,
-            }),
-          ]
-        : [],
+    backends: self.doEnv.LOADER
+      ? [
+          new WorkerShellBackend({
+            loader: self.doEnv.LOADER,
+            workspace: { binding: "Computer", id: self.doCtx.id.toString() },
+            ctx: self.doCtx,
+          }),
+        ]
+      : [],
   }),
 ) {
-  // computerd 从容器内向 DO 发起 /ws 升级建 capnweb 会话，交给容器后端处理
-  override async fetch(request: Request): Promise<Response> {
-    if (this.containerBackend) return this.containerBackend.handleFetch(request);
+  override async fetch(_request: Request): Promise<Response> {
     return new Response("container backend not configured", { status: 501 });
   }
 }
@@ -95,7 +70,6 @@ function fail(error: string, status = 400): Response {
 
 type ActionBody = {
   action?: string;
-  /** 哪台电脑：char:<角色id> / workshop / 其他自定义。字符白名单，一名一机。 */
   workspace?: string;
   path?: string;
   content?: string;
@@ -105,8 +79,8 @@ type ActionBody = {
 };
 
 const MAX_READ_CHARS = 200_000;
-const MAX_WRITE_CHARS = 2_000_000;      // 约 2MB 文本
-const MAX_WRITE_B64 = 8_000_000;        // 二进制 base64 上限（约 6MB 原始）
+const MAX_WRITE_CHARS = 2_000_000;
+const MAX_WRITE_B64 = 8_000_000;
 const MAX_EXEC_OUTPUT = 60_000;
 
 function cleanWorkspace(raw: unknown): string | null {
@@ -114,7 +88,6 @@ function cleanWorkspace(raw: unknown): string | null {
   return /^[A-Za-z0-9:_-]{1,120}$/.test(value) ? value : null;
 }
 
-/** 绝对路径化 + 禁越级。每台电脑有独立文件系统，无需再关目录笼子。 */
 function cleanPath(raw: unknown, fallback = "/"): string {
   let value = typeof raw === "string" ? raw.trim() : "";
   if (!value) value = fallback;
@@ -146,15 +119,7 @@ function fromBase64(b64: string): Uint8Array {
   return bytes;
 }
 
-// ── 内嵌 shell（保底）───────────────────────────
-// 账号没有 worker_loaders（beta）时，isolate 后端不可用；此时直接在本进程里
-// 跑 just-bash（Cloudflare shell worker 的同款内核），文件系统对接同一块硬盘。
-// 隔离性弱于动态 Worker，但命令只作用于虚拟盘、无网络（未配 fetch），风险面很小。
-
 const EMBEDDED_MAX_OUTPUT = 200_000;
-
-// 只读联网（给 curl 用）：仅 GET/HEAD、仅 http(s)、拦内网/回环地址、20s 超时、响应 ≤5MB。
-// Workers 环境本身触不到部署者内网，字面量拦截属于双保险。
 const FETCH_TIMEOUT_MS = 20_000;
 const FETCH_MAX_BYTES = 5 * 1024 * 1024;
 const PRIVATE_HOST_RE = /^(localhost$|127\.|10\.|192\.168\.|169\.254\.|0\.|\[?::1\]?$|172\.(1[6-9]|2\d|3[01])\.)/i;
@@ -186,8 +151,6 @@ const readOnlyFetch: SecureFetch = async (url, options = {}) => {
 
 type ExecOutcome = { stdout: string; stderr: string; exitCode: number; engine: "isolate" | "embedded" };
 
-// uname 壳：这里没有 Linux 内核，如实报告自己是台云端小电脑——
-// 免得探测脚本拿到 127 误判 shell 坏了
 const unameCommand = defineCommand("uname", async (args) => {
   const all = args.includes("-a");
   const stdout = all
@@ -212,8 +175,6 @@ async function runShell(ws: Awaited<ReturnType<typeof getWorkspace>>, command: s
     const bash = new Bash({
       fs: new WorkspaceFsAdapter(ws.fs as never) as never,
       cwd: "/",
-      // 只读联网：curl 仅 GET/HEAD（看网页、下载内容），不开写方法——
-      // Worker 不会被当成对外发请求的跳板
       fetch: readOnlyFetch,
       defenseInDepth: { enabled: false },
       executionLimits: { maxOutputSize: EMBEDDED_MAX_OUTPUT },
@@ -248,8 +209,6 @@ export default {
       using ws = await getWorkspace(stub as unknown as WorkspaceHandle);
       switch (body.action) {
         case "status": {
-          // 文件系统探活 + shell 探活（shell 不可用不算错，报告能力即可）。
-          // 用 uname 分辨壳的成色：容器里的真 Linux 回 "Linux"，内嵌壳如实回 "FloatOS"。
           await ws.fs.mkdir("/", { recursive: true }).catch(() => {});
           let shell = false;
           let engine: string | undefined;
@@ -259,7 +218,6 @@ export default {
             shell = probe.exitCode === 0;
             engine = probe.engine;
             if (shell) {
-              // uname 单独探（isolate 的 just-bash 没有 uname，会 127，不算 shell 坏）
               const u = await runShell(ws, "uname").catch(() => null);
               linux = u ? /\bLinux\b/.test(u.stdout) : false;
             }
