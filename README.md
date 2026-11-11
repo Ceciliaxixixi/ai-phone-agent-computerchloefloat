@@ -112,4 +112,3 @@
 
 `workspace` 约定：角色用 `char:<角色id>`，工坊用 `workshop`。
 
-
